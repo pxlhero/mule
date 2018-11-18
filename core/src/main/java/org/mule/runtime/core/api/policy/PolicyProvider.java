@@ -39,4 +39,7 @@ public interface PolicyProvider {
    */
   List<Policy> findOperationParameterizedPolicies(PolicyPointcutParameters policyPointcutParameters);
 
+  default void onPoliciesDeploymentChange(Runnable callback) {
+    // Nothing to do
+  }
 }

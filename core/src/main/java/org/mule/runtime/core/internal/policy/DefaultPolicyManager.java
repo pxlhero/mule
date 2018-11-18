@@ -6,12 +6,10 @@
  */
 package org.mule.runtime.core.internal.policy;
 
-import static java.util.Collections.emptyList;
-import static org.mule.runtime.api.message.Message.of;
+import static org.mule.runtime.core.api.functional.Either.left;
 import static org.mule.runtime.core.api.functional.Either.right;
 import static org.mule.runtime.core.privileged.processor.MessageProcessors.process;
 import static reactor.core.publisher.Mono.from;
-import static reactor.core.publisher.Mono.fromSupplier;
 import static reactor.core.publisher.Mono.just;
 
 import org.mule.runtime.api.component.Component;
@@ -34,10 +32,10 @@ import org.mule.runtime.policy.api.OperationPolicyPointcutParametersFactory;
 import org.mule.runtime.policy.api.PolicyPointcutParameters;
 import org.mule.runtime.policy.api.SourcePolicyPointcutParametersFactory;
 
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 import javax.inject.Inject;
 
@@ -54,13 +52,19 @@ public class DefaultPolicyManager implements PolicyManager, Initialisable {
   @Inject
   private PolicyStateHandler policyStateHandler;
 
-  private Collection<OperationPolicyParametersTransformer> operationPolicyParametersTransformerCollection = emptyList();
-  private Collection<SourcePolicyParametersTransformer> sourcePolicyParametersTransformerCollection = emptyList();
   private PolicyProvider policyProvider;
   private OperationPolicyProcessorFactory operationPolicyProcessorFactory;
   private SourcePolicyProcessorFactory sourcePolicyProcessorFactory;
 
   private PolicyPointcutParametersManager policyPointcutParametersManager;
+
+  // private final Cache<PolicyPointcutParameters, SourcePolicy> sourcePoliciesCache = Caffeine.newBuilder().build();
+  // private final Cache<PolicyPointcutParameters, OperationPolicy> operationPoliciesCache = Caffeine.newBuilder().build();
+  private final ConcurrentHashMap<ComponentIdentifier, Optional<SourcePolicyParametersTransformer>> sourceParametersTransformers =
+      new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<ComponentIdentifier, Optional<OperationPolicyParametersTransformer>> operationParametersTransformers =
+      new ConcurrentHashMap<>();
+
 
   @Override
   public SourcePolicy createSourcePolicyInstance(Component source, CoreEvent sourceEvent,
@@ -70,29 +74,36 @@ public class DefaultPolicyManager implements PolicyManager, Initialisable {
     PolicyPointcutParameters sourcePointcutParameters =
         policyPointcutParametersManager.createSourcePointcutParameters(source, sourceEvent);
 
+    // final SourcePolicy cachedPolicy = sourcePoliciesCache.getIfPresent(sourcePointcutParameters);
+    // if (cachedPolicy != null) {
+    // return cachedPolicy;
+    // }
+    //
+    // return sourcePoliciesCache.get(sourcePointcutParameters, p -> {
     List<Policy> parameterizedPolicies = policyProvider.findSourceParameterizedPolicies(sourcePointcutParameters);
     if (parameterizedPolicies.isEmpty()) {
-      return event -> from(process(event, flowExecutionProcessor))
-          .switchIfEmpty(fromSupplier(() -> CoreEvent.builder(sourceEvent).message(of(null)).build()))
+      return (event, respParamProcessor) -> from(process(event, flowExecutionProcessor))
+          // .switchIfEmpty(fromSupplier(() -> CoreEvent.builder(event).message(of(null)).build()))
           .<Either<SourcePolicyFailureResult, SourcePolicySuccessResult>>map(flowExecutionResult -> right(new SourcePolicySuccessResult(flowExecutionResult,
-                                                                                                                                        () -> messageSourceResponseParametersProcessor
+                                                                                                                                        () -> respParamProcessor
                                                                                                                                             .getSuccessfulExecutionResponseParametersFunction()
                                                                                                                                             .apply(flowExecutionResult),
-                                                                                                                                        messageSourceResponseParametersProcessor)))
+                                                                                                                                        respParamProcessor)))
           .onErrorResume(Exception.class, e -> {
             MessagingException messagingException = e instanceof MessagingException ? (MessagingException) e
                 : new MessagingException(event, e, (Component) flowExecutionProcessor);
-            return just(Either
-                .left(new SourcePolicyFailureResult(messagingException, () -> messageSourceResponseParametersProcessor
-                    .getFailedExecutionResponseParametersFunction()
-                    .apply(messagingException.getEvent()))));
+            return just(left(new SourcePolicyFailureResult(messagingException, () -> respParamProcessor
+                .getFailedExecutionResponseParametersFunction()
+                .apply(messagingException.getEvent()))));
           });
+    } else {
+      return new CompositeSourcePolicy(parameterizedPolicies,
+                                       lookupSourceParametersTransformer(source.getLocation().getComponentIdentifier()
+                                           .getIdentifier()),
+                                       sourcePolicyProcessorFactory, flowExecutionProcessor,
+                                       messageSourceResponseParametersProcessor);
     }
-    return new CompositeSourcePolicy(parameterizedPolicies,
-                                     lookupSourceParametersTransformer(source.getLocation().getComponentIdentifier()
-                                         .getIdentifier()),
-                                     sourcePolicyProcessorFactory, flowExecutionProcessor,
-                                     messageSourceResponseParametersProcessor);
+    // });
   }
 
   @Override
@@ -103,26 +114,49 @@ public class DefaultPolicyManager implements PolicyManager, Initialisable {
     PolicyPointcutParameters operationPointcutParameters =
         policyPointcutParametersManager.createOperationPointcutParameters(operation, event, operationParameters);
 
+    // final OperationPolicy cachedPolicy = operationPoliciesCache.getIfPresent(operationPointcutParameters);
+    // if (cachedPolicy != null) {
+    // return cachedPolicy;
+    // }
+    //
+    // return operationPoliciesCache.get(operationPointcutParameters, p -> {
     List<Policy> parameterizedPolicies = policyProvider.findOperationParameterizedPolicies(operationPointcutParameters);
     if (parameterizedPolicies.isEmpty()) {
-      return (operationEvent) -> operationExecutionFunction.execute(operationParameters, operationEvent);
+      return (operationEvent, opParamProcessor) -> operationExecutionFunction.execute(opParamProcessor.getOperationParameters());
     }
     return new CompositeOperationPolicy(parameterizedPolicies,
                                         lookupOperationParametersTransformer(operation.getLocation().getComponentIdentifier()
                                             .getIdentifier()),
                                         operationPolicyProcessorFactory, () -> operationParameters, operationExecutionFunction);
+    // });
   }
 
   private Optional<OperationPolicyParametersTransformer> lookupOperationParametersTransformer(ComponentIdentifier componentIdentifier) {
-    return operationPolicyParametersTransformerCollection.stream()
-        .filter(policyOperationParametersTransformer -> policyOperationParametersTransformer.supports(componentIdentifier))
-        .findAny();
+    Optional<OperationPolicyParametersTransformer> cached = operationParametersTransformers.get(componentIdentifier);
+    if (cached != null) {
+      return cached;
+    }
+
+    MuleRegistry registry = ((MuleContextWithRegistry) muleContext).getRegistry();
+
+    return operationParametersTransformers
+        .computeIfAbsent(componentIdentifier, cId -> registry.lookupObjects(OperationPolicyParametersTransformer.class).stream()
+            .filter(policyOperationParametersTransformer -> policyOperationParametersTransformer.supports(cId))
+            .findAny());
   }
 
   private Optional<SourcePolicyParametersTransformer> lookupSourceParametersTransformer(ComponentIdentifier componentIdentifier) {
-    return sourcePolicyParametersTransformerCollection.stream()
-        .filter(policyOperationParametersTransformer -> policyOperationParametersTransformer.supports(componentIdentifier))
-        .findAny();
+    Optional<SourcePolicyParametersTransformer> cached = sourceParametersTransformers.get(componentIdentifier);
+    if (cached != null) {
+      return cached;
+    }
+
+    MuleRegistry registry = ((MuleContextWithRegistry) muleContext).getRegistry();
+
+    return sourceParametersTransformers
+        .computeIfAbsent(componentIdentifier, cId -> registry.lookupObjects(SourcePolicyParametersTransformer.class).stream()
+            .filter(policyOperationParametersTransformer -> policyOperationParametersTransformer.supports(cId))
+            .findAny());
   }
 
   @Override
@@ -131,8 +165,12 @@ public class DefaultPolicyManager implements PolicyManager, Initialisable {
     sourcePolicyProcessorFactory = new DefaultSourcePolicyProcessorFactory(policyStateHandler);
     MuleRegistry registry = ((MuleContextWithRegistry) muleContext).getRegistry();
     policyProvider = registry.lookupLocalObjects(PolicyProvider.class).stream().findFirst().orElse(new NullPolicyProvider());
-    sourcePolicyParametersTransformerCollection = registry.lookupObjects(SourcePolicyParametersTransformer.class);
-    operationPolicyParametersTransformerCollection = registry.lookupObjects(OperationPolicyParametersTransformer.class);
+
+    policyProvider.onPoliciesDeploymentChange(() -> {
+      // sourcePoliciesCache.invalidateAll();
+      // operationPoliciesCache.invalidateAll();
+    });
+
     policyPointcutParametersManager =
         new PolicyPointcutParametersManager(registry.lookupObjects(SourcePolicyPointcutParametersFactory.class),
                                             registry.lookupObjects(OperationPolicyPointcutParametersFactory.class));
@@ -142,7 +180,6 @@ public class DefaultPolicyManager implements PolicyManager, Initialisable {
   public void disposePoliciesResources(String executionIdentifier) {
     policyStateHandler.destroyState(executionIdentifier);
   }
-
 
   public void setMuleContext(MuleContext muleContext) {
     this.muleContext = muleContext;

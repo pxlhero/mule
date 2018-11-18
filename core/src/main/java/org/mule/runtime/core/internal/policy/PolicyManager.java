@@ -14,10 +14,10 @@ import java.util.Map;
 
 /**
  * Manager for handling policies in Mule.
- * 
+ *
  * Implementation of this class will be used to lookup for {@code Policy}s that must be applied to {@code MessageSource}es or
  * {@code Processor}s.
- * 
+ *
  * @since 4.0
  */
 public interface PolicyManager {

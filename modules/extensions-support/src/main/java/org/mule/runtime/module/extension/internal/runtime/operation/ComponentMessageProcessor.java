@@ -32,8 +32,8 @@ import static org.mule.runtime.module.extension.internal.util.IntrospectionUtils
 import static org.mule.runtime.module.extension.internal.util.IntrospectionUtils.isVoid;
 import static org.mule.runtime.module.extension.internal.util.MuleExtensionUtils.getOperationExecutorFactory;
 import static org.slf4j.LoggerFactory.getLogger;
-import static reactor.core.publisher.Flux.error;
 import static reactor.core.publisher.Flux.from;
+import static reactor.core.publisher.Mono.error;
 import static reactor.core.publisher.Mono.fromCallable;
 import static reactor.core.publisher.Mono.subscriberContext;
 
@@ -127,7 +127,6 @@ public abstract class ComponentMessageProcessor<T extends ComponentModel> extend
     implements Processor, ParametersResolverProcessor<T>, Lifecycle {
 
   private static final Logger LOGGER = getLogger(ComponentMessageProcessor.class);
-
   static final String INVALID_TARGET_MESSAGE =
       "Root component '%s' defines an invalid usage of operation '%s' which uses %s as %s";
 
@@ -202,31 +201,29 @@ public abstract class ComponentMessageProcessor<T extends ComponentModel> extend
               && ((InternalEvent) event).getInternalParameters().containsKey(INTERCEPTION_RESOLVED_CONTEXT)) {
             ExecutionContextAdapter<T> operationContext = getPrecalculatedContext(event);
 
-            operationExecutionFunction = (parameters, operationEvent) -> {
+            operationExecutionFunction = parameters -> {
               operationContext.setCurrentScheduler(currentScheduler);
-              return doProcessWithErrorMapping(operationEvent, operationContext);
+              return doProcessWithErrorMapping(event, operationContext);
             };
           } else {
-            operationExecutionFunction = (parameters, operationEvent) -> {
-              ExecutionContextAdapter<T> operationContext;
+            operationExecutionFunction = parameters -> {
               try {
-                operationContext = createExecutionContext(configuration, parameters, operationEvent, currentScheduler);
+                return doProcessWithErrorMapping(event,
+                                                 createExecutionContext(configuration, parameters, event, currentScheduler));
               } catch (MuleException e) {
                 return error(e);
               }
-              return doProcessWithErrorMapping(operationEvent, operationContext);
             };
           }
 
           if (getLocation() != null) {
             ((DefaultFlowCallStack) event.getFlowCallStack()).setCurrentProcessorPath(resolvedProcessorRepresentation);
-            return Mono.from(policyManager
-                .createOperationPolicy(this, event, resolutionResult,
-                                       operationExecutionFunction)
-                .process(event));
+            return policyManager
+                .createOperationPolicy(this, event, resolutionResult, operationExecutionFunction)
+                .process(event, () -> resolutionResult);
           } else {
             // If this operation has no component location then it is internal. Don't apply policies on internal operations.
-            return Mono.from(operationExecutionFunction.execute(resolutionResult, event));
+            return operationExecutionFunction.execute(resolutionResult);
           }
         }));
   }
@@ -240,7 +237,7 @@ public abstract class ComponentMessageProcessor<T extends ComponentModel> extend
    * ReactorCompletionCallback where Mono.error is used but we don't have a reference to the processor there.
    */
   private Publisher<CoreEvent> doProcessWithErrorMapping(CoreEvent operationEvent, ExecutionContextAdapter<T> operationContext) {
-    return doProcess(operationEvent, operationContext)
+    return doProcess(operationContext)
         .onErrorMap(e -> !(e instanceof MessagingException), e -> new MessagingException(operationEvent, e, this));
   }
 
@@ -249,7 +246,7 @@ public abstract class ComponentMessageProcessor<T extends ComponentModel> extend
         .get(INTERCEPTION_RESOLVED_CONTEXT));
   }
 
-  protected Mono<CoreEvent> doProcess(CoreEvent event, ExecutionContextAdapter<T> operationContext) {
+  protected Mono<CoreEvent> doProcess(ExecutionContextAdapter<T> operationContext) {
     return executeOperation(operationContext)
         .map(value -> asReturnValue(operationContext, value))
         .switchIfEmpty(fromCallable(() -> asReturnValue(operationContext, null)))
